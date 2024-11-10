@@ -1,11 +1,14 @@
+import re
+import json
+from datetime import datetime
 import pytesseract
 from PIL import Image
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import Document
+from .models import Document, PersonalInformation
 from .serializers import DocumentSerializer
-
+from django.shortcuts import get_object_or_404
 
 class HomeView(APIView):
     def get(self, request):
@@ -52,13 +55,21 @@ class ProofOfIdentityView(APIView):
                 image = Image.open(uploaded_file)
                 extracted_text = pytesseract.image_to_string(image)
 
+                # Parse the extracted text
+                parsed_data = self.parse_ocr_text(extracted_text)
+
                 # Save the extracted text to the Document model
                 document.extracted_text = extracted_text
                 document.save()
 
+                # Compare with database data
+                comparison_result = self.compare_with_database(parsed_data)
+
                 return Response({
                     "message": "File uploaded and processed successfully",
-                    "extracted_text": extracted_text
+                    "extracted_text": extracted_text,
+                    # "splitted_text": parsed_data
+                    "comparison_result": comparison_result
                 }, status=status.HTTP_200_OK)
 
             except Exception as e:
@@ -69,6 +80,51 @@ class ProofOfIdentityView(APIView):
             # Log and handle any unexpected errors
             print(f"Unexpected error: {str(e)}")  # Logs error to the console
             return Response({"error": f"Unexpected error: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def parse_ocr_text(self, ocr_text):
+        # Remove multiple line breaks and replace them with a single space
+        extracted_text = re.sub(r"\n+", " ", ocr_text).strip()
+
+        # Define regex patterns for each field
+        patterns = {
+            "first_name": r"First Name\s+([A-Za-z]+)",
+            "last_name": r"Last Name\s+([A-Za-z]+)"
+        }
+
+        # Extract information using regex patterns
+        data = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, extracted_text)
+            data[key] = match.group(1).strip() if match else None
+
+        # Add full_name by concatenating first_name and last_name if both are present
+        if data["first_name"] and data["last_name"]:
+            data["full_name"] = f"{data['first_name']} {data['last_name']}"
+        else:
+            data["full_name"] = None
+
+        return data
+
+    @staticmethod
+    def compare_with_database(parsed_data):
+        # Query the PersonalInformation table based on full name
+        try:
+            user_profile = get_object_or_404(PersonalInformation, full_name=parsed_data["full_name"])
+
+            # Compare fields from parsed_data with UserProfile fields
+            mismatches = {}
+            for field, value in parsed_data.items():
+                db_value = getattr(user_profile, field, None)
+                if db_value != value:
+                    mismatches[field] = {"db_value": db_value, "extracted_value": value}
+
+            if not mismatches:
+                return {"message": "All fields match the database record."}
+            else:
+                return {"message": "Some fields do not match", "mismatches": mismatches}
+
+        except PersonalInformation.DoesNotExist:
+            return {"message": "No matching user profile found in the database."}
 
 
 class ProofOfAddressView(APIView):
